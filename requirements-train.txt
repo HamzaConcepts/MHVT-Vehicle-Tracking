@@ -1,0 +1,6 @@
+# Only needed for training / the optional detector (--model) / scripts/
+-r requirements.txt
+ultralytics
+lap>=0.5.12
+pillow
+pytest

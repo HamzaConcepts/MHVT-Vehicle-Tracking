@@ -1,116 +1,65 @@
-# MHVT Automatic Car Tracking Demo
+# MHVT - Multi-Drone Handover System for Continuous Vehicle Tracking (FYP demo)
 
-This project is a small computer-vision demonstration for the **Multi-Drone
-Handover System for Continuous Vehicle Tracking (MHVT)** FYP. It detects and
-tracks cars in a prerecorded road-traffic video. It does not simulate
-drones and does not use ROS 2, SUMO, or a web dashboard.
+An interactive prototype of the MHVT mission-control experience, driven by a real video:
 
-## Technologies
+1. **Load a video** (file dialog, or `python main.py my_video.mp4`).
+2. **Draw one zone per virtual UAV** on the first frame (or press `2`-`6` for automatic overlapping bands).
+3. **Click / drag a box on a vehicle.** It is tracked with a visual tracker (OpenCV VitTrack) and
+   enclosed in a box with a trail and a confidence score.
+4. A **zoomed "UAV camera" feed** follows the vehicle (cropped from the full-resolution frame).
+5. **Mission-control telemetry** shows every UAV's state, battery, link freshness and HandoverScore, plus a
+   coordinator log of the handover protocol (REQ -> ACK -> ACQUIRED -> COMMIT) as the vehicle moves between zones.
 
-- Python 3.10 or 3.11
-- YOLOv8n for lightweight car detection
-- ByteTrack through Ultralytics `model.track()` for automatic car IDs
-- OpenCV for video input, display, annotation, and output
+> **What is real and what is simulated.** Video, tracking box, zoom feed and the vehicle's position are
+> real. UAV battery, link quality, message latency/loss and the coordinator are *simulated* (as in the report's
+> FYP-1 scope). The zones are regions of one video frame standing in for different drones' coverage areas.
 
-## Setup
+## Run
+```bash
+git lfs pull                      # traffic.mp4 is stored in Git LFS (a clone without LFS gets a 133-byte stub)
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python main.py traffic.mp4
+```
+| Stage | Keys |
+|---|---|
+| Zones | drag = add zone, `2`-`6` = auto bands, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video) |
+| Select | click or drag on a vehicle, `Space` play/pause to find a good frame, `,` `.` step a frame, `Esc` back to zones |
+| Track | `Space` pause, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `R` reselect, `S` screenshot |
+| Any | `Q` quit |
 
-1. Open this folder in VS Code.
-2. Create and activate a virtual environment:
+Things worth showing in a defense: press `L` to inject 10 % packet loss, or `2` to silence UAV-2 and watch
+the coordinator time it out (~3 s), fall back to another successor, or fail safely while the sending UAV keeps ownership.
 
-   ```powershell
-   py -3.11 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-
-   If `py -3.11` is unavailable, use an installed Python 3.10 or 3.11
-   interpreter instead.
-
-3. Install the dependencies:
-
-   ```powershell
-   python -m pip install --upgrade pip
-   python -m pip install -r requirements.txt
-   ```
-
-The first run downloads the pretrained `yolov8n.pt` model automatically if it
-is not already present. CPU inference is selected by the program, so no GPU
-package is required. The project uses
-[`bytetrack_mhvt.yaml`](bytetrack_mhvt.yaml), which keeps lost tracks alive for
-a short occlusion while avoiding immediate ID reuse.
-
-## Input and output
-
-Put the provided prerecorded video at:
-
-```text
-MHVT_Vehicle_Tracking/traffic.mp4
+Headless / scripted (also records a video of the whole window):
+```bash
+python main.py traffic.mp4 --headless --zones auto:4 --target 1061,311,52,28 --save output/demo.mp4
 ```
 
-Run the demo with:
+## Honest status
+* **Tracker:** VitTrack reports a confidence score, so the status switches to **LOST** instead of silently
+  following the wrong object; LOST is final until you reselect (`R`). Fast camera motion or leaving the frame
+  ends a track - the sample drone clip moves quickly, so tracks last ~5-8 s.
+* **Detector (optional, needs `pip install -r requirements-train.txt`):** stock COCO YOLOv8 finds only ~5 % of
+  the vehicles in top-down footage. `weights/vehicle_visdrone_n_bootstrap.pt` is a *bootstrap* YOLOv8n fine-tuned
+  on VisDrone (single `vehicle` class, 6 epochs on 40 % of the data at 640 px, trained on a laptop-class CPU):
+  mAP50 0.64 on VisDrone val, ~25-30 vehicles found per frame of `traffic.mp4` instead of ~1. Use it with
+  `python main.py traffic.mp4 --model weights/vehicle_visdrone_n_bootstrap.pt` (detections are drawn while you pick
+  a frame and a click snaps to the vehicle). Retrain properly with `docs/TRAINING.md` for the final defense.
+* **Not implemented yet:** SUMO/TraCI simulation, database logging, FastAPI/WebSocket dashboard, ROS 2,
+  automatic cross-camera re-identification. See the report schedule.
 
-```powershell
-python main.py
+## Repository layout
 ```
-
-Tracking starts automatically when the video opens; no clicks or manual
-vehicle selection are used. A detector confidence threshold of `0.25` rejects
-very weak detections, while ByteTrack uses separate association thresholds.
-New IDs are drawn only after two consecutive observations. The window
-**MHVT - Automatic Vehicle Tracking**
-shows all active car tracks with confidence scores and ByteTrack IDs. YOLO uses
-a moderate `0.20` confidence threshold and is
-restricted to COCO class 2 (`car`), so trucks, buses, motorcycles, and
-non-car classes are not passed to the tracker. Green boxes are boxes returned
-by the detector/tracker for the current frame. The program does not draw
-guessed boxes or silently transfer a lost ID to another vehicle. The annotated
-video is saved as
-`output/tracked_traffic.mp4`.
-
-ByteTrack attempts to keep an ID attached to the same vehicle across
-consecutive frames. IDs can change when a vehicle is hidden, detections are
-lost, or vehicles overlap; they are not guaranteed to remain unchanged in
-every situation.
-
-Press **Q** while the video window is focused to stop processing. Resources
-are released automatically.
-
-To run a lightweight headless check over consecutive frames, use:
-
-```powershell
-python main.py --test-frames 120
+main.py                  interactive demo + headless mode
+mhvt/coordinator.py      zones, HandoverScore ranking, handover protocol state machine (pure Python, tested)
+mhvt/tracking.py         VitTrack wrapper with LOST logic; optional YOLO detector
+mhvt/render.py           window drawing (video, zoom feed, telemetry, log)
+models/                  VitTrack ONNX (Apache-2.0, from opencv_zoo)
+weights/                bootstrap vehicle detector (VisDrone fine-tune)
+scripts/                 prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
+tests/                   pytest for the coordinator (single owner, 10 % loss, faults, reproducibility)
+docs/                    DATASETS.md, TRAINING.md
+notebooks/               Colab/Kaggle training notebook
 ```
-
-This prints the number of unique IDs, frames containing active IDs, temporary
-missing-track observations, and possible identity-switch candidates. The last
-metric is an IoU-based warning only; proving identity switches requires
-ground-truth labels. To verify an ID visually, pause the output video and
-follow the same car across consecutive frames. Its `ID N` label should remain
-unchanged while it is visible. A short missed-detection gap may occur while
-ByteTrack retains the track; a new ID after a genuine exit/re-entry is
-expected.
-
-Optional webcam mode is available without changing the default video mode:
-
-```powershell
-python main.py --camera
-```
-
-## Detection versus tracking
-
-Object detection finds cars independently in each frame and returns bounding
-boxes. Object tracking links detections across frames, allowing the
-application to assign and maintain an ID for a car over time.
-
-## Common errors
-
-- **`traffic.mp4` not found:** Confirm the filename is exactly `traffic.mp4`
-  and that it is in the same folder as `main.py`.
-- **Video cannot be opened:** Try a standard MP4 encoded with H.264 or
-  MPEG-4, and confirm the file is not corrupted.
-- **`No module named ...`:** Activate `.venv` and run
-  `python -m pip install -r requirements.txt` again.
-- **Slow processing:** Close other applications, use a shorter video, and
-  keep the lightweight 960x540 display and `imgsz=960` settings.
-- **Model download failure:** Check the internet connection and run the
-  program again; `yolov8n.pt` is downloaded only when it is not already
-  available locally.
+Run the tests with `pip install pytest && pytest -q`.

@@ -1,4 +1,8 @@
+output/
+datasets/
+runs/
+*.zones.json
 .venv/
 __pycache__/
 *.pyc
-output/
+.pytest_cache/

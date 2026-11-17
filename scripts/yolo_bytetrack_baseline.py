@@ -1,4 +1,4 @@
-"""Lightweight automatic multi-vehicle tracking demo for the MHVT project."""
+"""BASELINE (kept for the evaluation write-up): automatic multi-vehicle tracking demo for the MHVT project."""
 
 import argparse
 from pathlib import Path
@@ -7,7 +7,7 @@ import cv2
 from ultralytics import YOLO
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 INPUT_VIDEO = PROJECT_DIR / "traffic.mp4"
 OUTPUT_DIR = PROJECT_DIR / "output"
 OUTPUT_VIDEO = OUTPUT_DIR / "tracked_traffic.mp4"
