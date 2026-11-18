@@ -23,17 +23,38 @@ python main.py traffic.mp4
 ```
 | Stage | Keys |
 |---|---|
-| Zones | drag = add zone, `2`-`6` = auto bands, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video) |
+| Zones | drag = add zone, `2`-`6` = auto bands, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video), `O` load saved scenario |
 | Select | click or drag on a vehicle, `Space` play/pause to find a good frame, `,` `.` step a frame, `Esc` back to zones |
-| Track | `Space` pause, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `R` reselect, `S` screenshot |
+| Track | `Space` pause, **`T` restart the run**, **`K` save scenario**, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `R` reselect, `O` load scenario, `S` screenshot |
 | Any | `Q` quit |
 
 Things worth showing in a defense: press `L` to inject 10 % packet loss, or `2` to silence UAV-2 and watch
 the coordinator time it out (~3 s), fall back to another successor, or fail safely while the sending UAV keeps ownership.
 
+## Repeatable runs (save / replay / restart)
+A **scenario** captures everything needed to repeat a test: the zones, the start frame, the vehicle you picked,
+the random seed, the message-loss setting, and every live action you took during the run (loss changes, UAV faults,
+zoom) with the frame it happened at.
+
+1. Set up a run the way you want it, inject whatever faults you want to show, then press **`K`**.
+   This writes `<video>.scenario.json` next to the video (commit it; it is small).
+2. Replay it identically any time: press **`O`** in the window, or start with
+   ```bash
+   python main.py clip.mp4 --replay                  # uses clip.scenario.json
+   python main.py clip.mp4 --scenario my_case.json   # a specific file
+   ```
+3. **`T`** restarts the current run from its first frame with a fresh coordinator. A run you built live restarts
+   clean (no injected events); a replayed scenario restarts with its scripted events re-applied.
+4. The program also autosaves `<video>.last_run.json` when you pick a vehicle and when you quit, so a good run is
+   never lost. Rename it to keep it.
+
+Replays are deterministic: the tracker and the seeded coordinator give the same result every time on the same
+video (checked in testing). Keep the video file name unchanged, because a scenario is tied to it.
+
 Headless / scripted (also records a video of the whole window):
 ```bash
 python main.py traffic.mp4 --headless --zones auto:4 --target 1061,311,52,28 --save output/demo.mp4
+python main.py traffic.mp4 --headless --replay --save output/replay.mp4      # render a saved scenario
 ```
 
 ## Honest status
@@ -55,6 +76,7 @@ main.py                  interactive demo + headless mode
 mhvt/coordinator.py      zones, HandoverScore ranking, handover protocol state machine (pure Python, tested)
 mhvt/tracking.py         VitTrack wrapper with LOST logic; optional YOLO detector
 mhvt/render.py           window drawing (video, zoom feed, telemetry, log)
+mhvt/scenario.py         save/load of a repeatable run (zones, target, seed, events)
 models/                  VitTrack ONNX (Apache-2.0, from opencv_zoo)
 weights/                bootstrap vehicle detector (VisDrone fine-tune)
 scripts/                 prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
