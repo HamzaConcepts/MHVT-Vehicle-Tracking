@@ -29,6 +29,10 @@ class Scenario:
     loss: float = 0.0
     zoom: float = 3.0
     events: list[dict] = field(default_factory=list)
+    tracker: str = "vit"              # vit | bytetrack | botsort (files written before this existed used vit)
+    model: str = ""                   # detector weights file name (detector backends)
+    occluders: list[list[float]] = field(default_factory=list)  # normalised x1,y1,x2,y2 (simulated bridges)
+    max_occlusion_s: float = 8.0
     version: int = VERSION
 
     def validate(self) -> None:
@@ -36,6 +40,10 @@ class Scenario:
             raise ValueError("scenario needs at least one zone of 4 numbers")
         if len(self.target) != 4 or self.target[2] <= 0 or self.target[3] <= 0:
             raise ValueError("scenario target must be x,y,w,h with positive size")
+        if self.tracker not in ("vit", "bytetrack", "botsort"):
+            raise ValueError(f"unknown tracker '{self.tracker}'")
+        if any(len(o) != 4 or o[2] <= o[0] or o[3] <= o[1] for o in self.occluders):
+            raise ValueError("occluders must be x1,y1,x2,y2 with x2>x1, y2>y1")
         for ev in self.events:
             if ev.get("type") not in EVENT_TYPES or "frame" not in ev:
                 raise ValueError(f"bad event in scenario: {ev}")

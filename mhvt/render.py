@@ -37,13 +37,15 @@ STATE_COLORS = {
 }
 
 HINTS = {
-    "zones": [("Drag", "Add zone"), ("2-6", "Auto zones"), ("Bksp", "Undo"), ("C", "Clear"), ("Enter", "Continue"), ("O", "Load scenario"), ("Q", "Quit")],
-    "select": [("Click", "Pick vehicle"), ("Space", "Play / pause"), (", .", "Step frame"), ("Esc", "Back to zones"), ("O", "Load scenario"), ("Q", "Quit")],
+    "zones": [("2-6", "Equal zones"), ("V H G", "Layout"), ("A", "Auto layout"), ("[ ]", "Overlap"), ("Drag", "Custom zone"),
+              ("Shift+Drag", "Bridge"), ("Bksp", "Undo"), ("C", "Clear"), ("Enter", "Continue"), ("O", "Load"), ("Q", "Quit")],
+    "select": [("Click", "Pick vehicle"), ("Space", "Play / pause"), (", .", "Step frame"), ("Shift+Drag", "Bridge"), ("X", "Clear bridges"),
+               ("Esc", "Zones"), ("O", "Load"), ("Q", "Quit")],
     "track": [("Space", "Pause"), ("T", "Restart"), ("K", "Save scenario"), ("E", "Report"), ("Z", "Zoom"), ("L", "Msg loss"),
               ("1-6", "UAV fault"), ("R", "Reselect"), ("F", "Fullscreen"), ("Q", "Quit")],
 }
 INSTRUCTION = {
-    "zones": "Step 1 of 3 - drag to draw one zone per UAV, or press 2-6 for automatic zones",
+    "zones": "Step 1 of 3 - press 2-6 for equal zones (V/H/G layout, A auto), or drag your own",
     "select": "Step 2 of 3 - click or drag a box on the vehicle to track (Space plays the video)",
 }
 
@@ -71,6 +73,12 @@ class Scene:
     nframes: int = 0
     t: float = 0.0
     toast: str = ""
+    predicted: bool = False          # target position is dead-reckoned (occluded)
+    std: float = 0.0                 # uncertainty radius of the prediction, working px
+    occluded_s: float = 0.0
+    others: list = field(default_factory=list)      # [(id, (x,y,w,h))] other tracked vehicles
+    occluders: list = field(default_factory=list)   # [(x1,y1,x2,y2)] simulated bridges, working px
+    backend: str = ""
 
 
 @dataclass
@@ -310,7 +318,9 @@ class UI:
         mm, ss = divmod(sc.t, 60)
         rx -= self.chip(rx, cy - u(11), f"{int(mm):02d}:{ss:04.1f}", 11, bg=CARD, fg=TEXT, align="r", border=LINE) + u(8)
         name = sc.video_name if len(sc.video_name) < 34 else sc.video_name[:31] + "…"
-        self.chip(rx, cy - u(11), name, 11, bg=CARD, fg=DIM, bold=False, align="r", border=LINE)
+        rx -= self.chip(rx, cy - u(11), name, 11, bg=CARD, fg=DIM, bold=False, align="r", border=LINE) + u(8)
+        if sc.backend:
+            self.chip(rx, cy - u(11), sc.backend, 11, bg=CARD, fg=CYAN, bold=True, align="r", border=LINE)
 
     # ------------------------------------------------------------------ video
     def _video(self, sc: Scene):
@@ -323,6 +333,23 @@ class UI:
             cv2.rectangle(self.canvas, P((x, y)), P((x + w, y + h)), (210, 210, 210), 1, cv2.LINE_AA)
         track = sc.stage == "track"
         coord = sc.coord if track else None
+        for (ox1, oy1, ox2, oy2) in sc.occluders:  # simulated bridge / occluder: hatched dark band
+            a, b = P((ox1, oy1)), P((ox2, oy2))
+            self.rect_alpha(a[0], a[1], b[0], b[1], INK, 0.35)
+            step = max(8, u(14))
+            for d in range(-(b[1] - a[1]), b[0] - a[0], step):
+                p1 = (a[0] + max(d, 0), a[1] + max(-d, 0))
+                span = min(b[0] - p1[0], b[1] - p1[1])
+                if span > 0:
+                    cv2.line(self.canvas, p1, (p1[0] + span, p1[1] + span), FAINT, 1, cv2.LINE_AA)
+            cv2.rectangle(self.canvas, a, b, FAINT, max(1, u(1.5)), cv2.LINE_AA)
+            self.chip(a[0] + u(8), min(b[1], y2 - u(34)) - u(34), "BRIDGE (simulated occlusion)", 10.5, bg=INK, fg=DIM, alpha=0.9)
+        if track:
+            for (tid, (x, y, w, h)) in sc.others:  # every other tracked vehicle, with its tracker ID
+                a, b = P((x, y)), P((x + w, y + h))
+                cv2.rectangle(self.canvas, a, b, (205, 205, 205), 1, cv2.LINE_AA)
+                if (b[0] - a[0]) >= u(26):
+                    self.text(a[0] + 2, a[1] - u(5), str(tid), 9, (225, 225, 225), True)
         # zones
         for i, z in enumerate(sc.zones):
             c = ZONE_COLORS[i % len(ZONE_COLORS)]
@@ -353,6 +380,8 @@ class UI:
                 st, col = "END OF VIDEO", AMBER
             elif sc.lost:
                 st, col = "TARGET LOST", RED
+            elif sc.predicted:
+                st, col = "PREDICTING", AMBER
             elif sc.paused:
                 st, col = "PAUSED", AMBER
             else:
@@ -367,7 +396,9 @@ class UI:
             own = f"UAV-{sc.coord.owner}" if sc.coord.owner else "no UAV"
             hint = {"TARGET LOST": "Tracker lost the vehicle - T restarts the run, R picks another",
                     "END OF VIDEO": "T restarts the run, K saves the scenario, E writes the report",
-                    "PAUSED": "Paused - press Space to resume"}.get(st, f"Following target #1 - primary owner {own}")
+                    "PAUSED": "Paused - press Space to resume",
+                    "PREDICTING": f"Target hidden for {sc.occluded_s:.1f}s - path prediction active, waiting for it to re-appear"
+                    }.get(st, f"Following target #1 - primary owner {own}")
         else:
             hint = INSTRUCTION[sc.stage]
         bar_h = u(34)
@@ -394,6 +425,25 @@ class UI:
         x, y, w, h = sc.bbox
         pad = 5
         a, b = P((x - pad, y - pad)), P((x + w + pad, y + h + pad))
+        if sc.predicted:  # dead-reckoned position: dashed amber box + uncertainty circle
+            cxp, cyp = (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
+            rr = int(max(u(10), sc.std * self.L.video_scale()))
+            cv2.circle(self.canvas, (cxp, cyp), rr, AMBER, max(1, u(1.2)), cv2.LINE_AA)
+            dash = max(5, u(7))
+            for (p1, p2) in (((a[0], a[1]), (b[0], a[1])), ((b[0], a[1]), (b[0], b[1])), ((b[0], b[1]), (a[0], b[1])), ((a[0], b[1]), (a[0], a[1]))):
+                n_ = max(int(np.hypot(p2[0] - p1[0], p2[1] - p1[1])), 1)
+                for k in range(0, n_, dash * 2):
+                    f1, f2 = k / n_, min(k + dash, n_) / n_
+                    q1 = (int(p1[0] + (p2[0] - p1[0]) * f1), int(p1[1] + (p2[1] - p1[1]) * f1))
+                    q2 = (int(p1[0] + (p2[0] - p1[0]) * f2), int(p1[1] + (p2[1] - p1[1]) * f2))
+                    cv2.line(self.canvas, q1, q2, AMBER, max(2, u(2.5)), cv2.LINE_AA)
+            lab = f"PREDICTED  {sc.occluded_s:.1f}s"
+            wl = self.twidth(lab, 11.5, True) + u(18)
+            ly = a[1] - u(26) if a[1] - u(26) > self.L.video_px()[1] + u(44) else b[1] + u(6)
+            self.rrect(a[0], ly, a[0] + wl, ly + u(22), u(6), fill=AMBER)
+            self.text(a[0] + wl / 2, ly + u(11), lab, 11.5, INK, True, "c")
+            self._handover_arrow(sc, P)
+            return
         cv2.rectangle(self.canvas, a, b, GREEN, max(1, u(1.5)), cv2.LINE_AA)
         arm = max(u(10), min(u(18), (b[0] - a[0]) // 3))
         t = max(2, u(3.5))
@@ -405,7 +455,10 @@ class UI:
         ly = a[1] - u(26) if a[1] - u(26) > self.L.video_px()[1] + u(44) else b[1] + u(6)
         self.rrect(a[0], ly, a[0] + wl, ly + u(22), u(6), fill=GREEN)
         self.text(a[0] + wl / 2, ly + u(11), lab, 11.5, INK, True, "c")
-        # handover arrow
+        self._handover_arrow(sc, P)
+
+    def _handover_arrow(self, sc: Scene, P):
+        u = self.L.u
         h_ = sc.coord.handover
         if h_ and len(sc.zones) >= max(h_.source, h_.successor):
             zc = lambda i: P(((sc.zones[i - 1][0] + sc.zones[i - 1][2]) / 2, (sc.zones[i - 1][1] + sc.zones[i - 1][3]) / 2))  # noqa: E731
@@ -432,10 +485,11 @@ class UI:
         crop = sc.full[fy0:fy0 + int(ch), fx0:fx0 + int(cw)]
         view = cv2.resize(crop, (pw, ph), interpolation=cv2.INTER_CUBIC)
         active = sc.stage == "track" and not sc.lost
+        amber = active and sc.predicted
         if not active:
             view = (view * 0.30).astype(np.uint8)
         self.canvas[y1:y2, x1:x2] = view
-        col = GREEN if active else RED if sc.stage == "track" else FAINT
+        col = AMBER if amber else GREEN if active else RED if sc.stage == "track" else FAINT
         m, arm, t = u(14), u(26), max(2, u(2.5))
         for (px, py), (dx, dy) in (((x1 + m, y1 + m), (1, 1)), ((x2 - m, y1 + m), (-1, 1)), ((x1 + m, y2 - m), (1, -1)), ((x2 - m, y2 - m), (-1, -1))):
             cv2.line(self.canvas, (px, py), (px + arm * dx, py), col, t, cv2.LINE_AA)
@@ -443,14 +497,14 @@ class UI:
         if active:
             tx = int(x1 + (cx - fx0) / cw * pw)
             ty = int(y1 + (cy - fy0) / ch * ph)
-            cv2.drawMarker(self.canvas, (tx, ty), GREEN, cv2.MARKER_CROSS, u(22), max(1, u(1.5)), cv2.LINE_AA)
+            cv2.drawMarker(self.canvas, (tx, ty), col, cv2.MARKER_CROSS, u(22), max(1, u(1.5)), cv2.LINE_AA)
         owner = sc.coord.owner
         name = f"UAV-{owner} CAMERA" if owner else "UAV CAMERA"
-        st = f"{sc.zoom:.0f}x   " + ("LOCKED" if active else "NO LOCK" if sc.stage == "track" else "STANDBY")
+        st = f"{sc.zoom:.0f}x   " + ("DEAD RECKONING" if amber else "LOCKED" if active else "NO LOCK" if sc.stage == "track" else "STANDBY")
         w = self.twidth(f"{name}   {st}", 12, True) + u(30)
         self.rrect(x1 + u(10), y1 + u(10), x1 + u(10) + w, y1 + u(36), u(13), fill=INK, alpha=0.8)
         self.dot(x1 + u(24), y1 + u(23), u(5), col)
-        self.text(x1 + u(35), y1 + u(23), f"{name}   {st}", 12, col if not active else TEXT, True)
+        self.text(x1 + u(35), y1 + u(23), f"{name}   {st}", 12, AMBER if amber else (col if not active else TEXT), True)
         if not active:
             msg = "TARGET LOST" if sc.stage == "track" else "Pick a vehicle to start the camera feed"
             self.text((x1 + x2) // 2, (y1 + y2) // 2 - u(6), msg, 20 if sc.stage == "track" else 14, RED if sc.stage == "track" else DIM, True, "c")
@@ -469,11 +523,12 @@ class UI:
         self.text(ix1, y1 + u(22), "TELEMETRY", 12.5, DIM, True)
         self.chip(ix2, y1 + u(11), "SIMULATED", 10, bg=PANEL, fg=AMBER, align="r", h=20, border=AMBER)
         # stat tiles
-        status = "IDLE" if sc.stage != "track" else ("LOST" if sc.lost else "TRACKING")
+        status = "IDLE" if sc.stage != "track" else ("LOST" if sc.lost else "PREDICTING" if sc.predicted else "TRACKING")
         s = co.summary()
         rate = "-" if s["success_rate"] is None else f"{100 * s['success_rate']:.0f}% success"
         tiles = [
-            ("TARGET", status, {"TRACKING": GREEN, "LOST": RED}.get(status, DIM), f"score {sc.score:.2f}" if status == "TRACKING" else " "),
+            ("TARGET", status, {"TRACKING": GREEN, "LOST": RED, "PREDICTING": AMBER}.get(status, DIM),
+             f"score {sc.score:.2f}" if status == "TRACKING" else f"hidden {sc.occluded_s:.1f}s" if status == "PREDICTING" else " "),
             ("PRIMARY OWNER", f"UAV-{co.owner}" if co.owner else "none", TEXT if co.owner else DIM, "single owner" if co.owner else " "),
             ("HANDOVERS", f"{s['handovers_ok']} ok / {s['handovers_failed']} failed", TEXT, rate),
         ]

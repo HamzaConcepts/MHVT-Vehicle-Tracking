@@ -7,8 +7,9 @@ it get tracked with a zoomed 'drone camera' feed and simulated multi-UAV telemet
     python main.py video --zones auto:3 --target 640,330,52,28 --headless --save out.mp4
 
 Keys (interactive)
-  zones   : drag = add zone | 2-6 = auto bands | Backspace = undo | C = clear | Enter = continue | O = load scenario
-  select  : drag/click on a vehicle | Space = play/pause | , . = step frame | Esc = back to zones | O = load scenario
+  zones   : 2-6 = equal zones | V/H/G = vertical/horizontal/grid | A = auto layout | [ ] = overlap | drag = custom zone
+            Shift+drag = simulated bridge | X = clear bridges | Backspace = undo | C = clear | Enter = continue | O = load
+  select  : drag/click on a vehicle | Space = play/pause | , . = step frame | Shift+drag = bridge | X | Esc = back to zones
   track   : Space pause | T restart run | K save scenario | Z zoom | L message loss 0/10/30%
             1-6 toggle UAV fault | R reselect | S screenshot | O load scenario
   anywhere: Q quit
@@ -28,10 +29,12 @@ import cv2
 
 from mhvt import render as R
 from mhvt.render import UI, Layout, Scene
-from mhvt.coordinator import Config, Coordinator, auto_zones
+from mhvt.coordinator import Config, Coordinator
 from mhvt.metrics import write_report
+from mhvt.motion import CameraMotion
 from mhvt.scenario import Scenario, default_path, last_run_path
-from mhvt.tracking import Detector, TargetTracker, snap_to_detection
+from mhvt.tracking import VitFollower, build_follower, snap_to_detection
+from mhvt.zoning import MAX_ZONES, equal_zones, suggest_layout_from_video
 
 ROOT = Path(__file__).resolve().parent
 WINDOW = "MHVT - Multi-Drone Handover Demo"
@@ -48,10 +51,20 @@ def parse_args():
     ap.add_argument("--replay", action="store_true", help="replay <video>.scenario.json")
     ap.add_argument("--start-frame", type=int, default=0)
     ap.add_argument("--max-frames", type=int)
-    ap.add_argument("--headless", action="store_true", help="no window (needs --scenario/--replay or --zones + --target)")
+    ap.add_argument("--headless", action="store_true", help="no window (needs --scenario/--replay, or --zones/--zone-count + --target)")
     ap.add_argument("--save", type=Path, help="write the composite window to this mp4")
     ap.add_argument("--screenshots", default="", help="comma list of tracked-frame numbers to save as PNG (headless)")
-    ap.add_argument("--model", help="optional YOLO weights (drone-view/VisDrone) for click-to-snap detections")
+    ap.add_argument("--tracker", choices=["auto", "vit", "bytetrack", "botsort"], default="auto",
+                    help="auto = YOLO+ByteTrack with path prediction if available, else VitTrack")
+    ap.add_argument("--model", help="YOLO weights (default: weights/vehicle_visdrone_n_bootstrap.pt)")
+    ap.add_argument("--imgsz", type=int, default=1280, help="detector input size (960 = faster, 1280 = more accurate)")
+    ap.add_argument("--conf", type=float, default=0.20, help="detector confidence threshold")
+    ap.add_argument("--max-occlusion", type=float, default=8.0, help="seconds to keep predicting a hidden target")
+    ap.add_argument("--occluder", action="append", default=[], metavar="X1,Y1,X2,Y2",
+                    help="simulated bridge, as fractions of the frame (repeatable), e.g. 0.4,0.3,0.6,0.7")
+    ap.add_argument("--zone-count", type=int, help="make this many equal zones automatically (2-6)")
+    ap.add_argument("--zone-layout", choices=["vertical", "horizontal", "grid", "auto"], default="vertical")
+    ap.add_argument("--zone-overlap", type=float, default=0.15, help="overlap between neighbouring zones (0-0.5)")
     ap.add_argument("--loss", type=float, default=0.0, help="initial coordinator message loss probability")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--zoom", type=float, default=3.0)
@@ -99,8 +112,19 @@ class App:
             sys.exit(f"OpenCV could not open: {self.video}")
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.detector = Detector(args.model) if args.model else None
-        self.tracker = TargetTracker()
+        ga = lambda n, d: getattr(args, n, d)  # noqa: E731  (older callers build args by hand)
+        self.max_occ = ga("max_occlusion", 8.0)
+        self.set_backend(ga("tracker", "auto"), ga("model", None), ga("imgsz", 1280), ga("conf", 0.20))
+        self.occluders: list[list[float]] = []   # normalised x1,y1,x2,y2 (simulated bridges)
+        for o in ga("occluder", []) or []:
+            self.occluders.append([float(v) for v in o.split(",")])
+        self.zone_n = ga("zone_count", None) or 3
+        self.zone_layout = ga("zone_layout", "vertical")
+        self.zone_overlap = ga("zone_overlap", 0.15)
+        self._auto_layout: str | None = None
+        self.det_for = -1
+        self.cam = CameraMotion((R.WORK_W, R.WORK_H))
+        self.small_gray = None
         self.zoom = args.zoom
         self.seed = args.seed
         self.loss = args.loss
@@ -118,6 +142,9 @@ class App:
         self.zoom_c = (R.WORK_W / 2, R.WORK_H / 2)
         self.bbox = None
         self.score = 0.0
+        self.predicted, self.std, self.occluded_s, self.others = False, 0.0, 0.0, []
+        self.pred_log: list = []
+        self.drag_kind = "zone"
         self.track_frames = 0
         self.detections = []
         self.writer = None
@@ -148,15 +175,46 @@ class App:
     def msg(self, v: str) -> None:
         self._msg, self._msg_until = v, (time.time() + 4.0 if v else 0.0)
 
+    def set_backend(self, kind: str, weights=None, imgsz: int = 1280, conf: float = 0.20) -> None:
+        self.follower, self.backend_desc = build_follower(kind, self.fps, weights, imgsz, conf, self.max_occ)
+        self.kind = "vit" if isinstance(self.follower, VitFollower) else self.follower.name.split("+")[1]
+        self.weights_name = "" if self.kind == "vit" else Path(weights or "weights/vehicle_visdrone_n_bootstrap.pt").name
+        self._backend_args = (weights, imgsz, conf)
+        print("Tracker:", self.backend_desc)
+
+    @property
+    def backend_label(self) -> str:
+        return {"vit": "VitTrack", "bytetrack": "YOLO + ByteTrack", "botsort": "YOLO + BoT-SORT"}[self.kind]
+
     # ------------------------------------------------------------ frames
+    def apply_occluders(self) -> None:
+        for x1, y1, x2, y2 in self.occluders:  # blank the pixels: the detector and tracker truly cannot see there
+            for img in (self.full, self.work):
+                h, w = img.shape[:2]
+                cv2.rectangle(img, (int(x1 * w), int(y1 * h)), (int(x2 * w), int(y2 * h)), (24, 26, 30), -1)
+
     def read(self) -> bool:
         ok, f = self.cap.read()
         if not ok:
             return False
         self.frame_no += 1
         self.full = letterbox_169(f)
+        if self.occluders:
+            self.full = self.full.copy()
         self.work = cv2.resize(self.full, (R.WORK_W, R.WORK_H), interpolation=cv2.INTER_AREA)
+        self.small_gray = CameraMotion.prepare(self.work)  # camera motion is measured on the un-blanked picture
+        if self.occluders:
+            self.apply_occluders()
         return True
+
+    def refresh_frame(self) -> None:
+        """Re-read the current frame (after the bridge list changed)."""
+        n = self.frame_no
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, n))
+        self.frame_no = n - 1
+        self.read()
+        self.det_for = -1
+        self.detections = []
 
     def seek(self, n: int) -> None:
         n = max(0, min(self.nframes - 1, n))
@@ -166,9 +224,28 @@ class App:
         self.detections = []
 
     # -------------------------------------------------------------- zones
+    def resolve_layout(self) -> str:
+        if self.zone_layout != "auto":
+            return self.zone_layout
+        if self._auto_layout is None:  # look at the motion in the video once
+            self._auto_layout = suggest_layout_from_video(self.video)
+        return self._auto_layout
+
+    def set_equal_zones(self, n: int | None = None, layout: str | None = None, overlap: float | None = None) -> None:
+        self.zone_n = min(MAX_ZONES, max(1, n if n is not None else self.zone_n))
+        self.zone_layout = layout or self.zone_layout
+        self.zone_overlap = min(0.5, max(0.0, self.zone_overlap if overlap is None else overlap))
+        lay = self.resolve_layout()
+        self.zones = equal_zones(R.WORK_W, R.WORK_H, self.zone_n, lay, self.zone_overlap)
+        shown = lay if self.zone_layout != "auto" else f"auto -> {lay}"
+        self.msg = f"{self.zone_n} equal zones - {shown}, {int(self.zone_overlap * 100)}% overlap"
+
     def load_zones(self, spec: str | None) -> None:
         if spec and spec.startswith("auto:"):
-            self.zones = auto_zones(R.WORK_W, R.WORK_H, int(spec[5:]))
+            self.set_equal_zones(int(spec[5:]))
+            return
+        if not spec and getattr(self.args, "zone_count", None):
+            self.set_equal_zones(self.args.zone_count)
             return
         path = Path(spec) if spec else (self.sidecar if self.sidecar.is_file() else None)
         if path and path.is_file():
@@ -187,7 +264,9 @@ class App:
         return Scenario(video=self.video.name, frames=self.nframes, fps=round(self.fps, 3),
                         start_frame=self.run_start, zones=self.norm_zones(), target=list(self.run_bbox),
                         seed=self.seed, loss=self.run_loss, zoom=self.run_zoom,
-                        events=list(self.replay_events if self.replaying else self.events))
+                        events=list(self.replay_events if self.replaying else self.events),
+                        tracker=self.kind, model=self.weights_name, occluders=[list(o) for o in self.occluders],
+                        max_occlusion_s=self.max_occ)
 
     def save_scenario(self, path: Path | None = None) -> Path | None:
         if self.run_bbox is None:
@@ -220,6 +299,13 @@ class App:
             print("WARNING:", "; ".join(warn))
         self.zones = [(a * R.WORK_W, b * R.WORK_H, c * R.WORK_W, d * R.WORK_H) for a, b, c, d in sc.zones]
         self.seed, self.loss, self.zoom = sc.seed, sc.loss, sc.zoom
+        self.occluders, self.max_occ = [list(o) for o in sc.occluders], sc.max_occlusion_s
+        if sc.tracker != self.kind:  # replay with the backend the scenario was made with
+            w = self._backend_args[0]
+            if sc.tracker != "vit" and sc.model and (not w or Path(w).name != sc.model):
+                w = ROOT / "weights" / sc.model
+            print(f"Switching tracker to '{sc.tracker}' as recorded in the scenario")
+            self.set_backend(sc.tracker, w, self._backend_args[1], self._backend_args[2])
         self.seek(sc.start_frame)
         self.begin_run(tuple(sc.target), events=sc.events, replaying=True)
         self.coord.log(0.0, f"Scenario loaded: {Path(path).name}"
@@ -239,19 +325,25 @@ class App:
             return
         pt = self.to_work(x, y)
         if event == cv2.EVENT_LBUTTONDOWN and pt:
+            self.drag_kind = "bridge" if flags & cv2.EVENT_FLAG_SHIFTKEY else "zone"
             self.drag0 = self.drag1 = pt
         elif event == cv2.EVENT_MOUSEMOVE and self.drag0 and pt:
             self.drag1 = pt
         elif event == cv2.EVENT_LBUTTONUP and self.drag0:
             end = pt or self.drag1
-            self.finish_drag(self.drag0, end)
+            self.finish_drag(self.drag0, end, self.drag_kind == "bridge")
             self.drag0 = self.drag1 = None
 
-    def finish_drag(self, a, b):
+    def finish_drag(self, a, b, bridge: bool = False):
         x1, x2 = sorted((a[0], b[0]))
         y1, y2 = sorted((a[1], b[1]))
         small = (x2 - x1) < 12 or (y2 - y1) < 12
-        if self.stage == "zones":
+        if bridge:
+            if not small:
+                self.occluders.append([x1 / R.WORK_W, y1 / R.WORK_H, x2 / R.WORK_W, y2 / R.WORK_H])
+                self.refresh_frame()
+                self.msg = f"Bridge added ({len(self.occluders)}) - X clears them"
+        elif self.stage == "zones":
             if not small and len(self.zones) < 6:
                 self.zones.append((x1, y1, x2, y2))
         else:
@@ -277,8 +369,10 @@ class App:
         self.events = []
         self.track_log = []
         self.report_done = False
-        self.tracker.init(self.work, self.run_bbox)
+        self.cam.reset(self.small_gray)
+        self.follower.init(self.work, self.run_bbox)
         self.bbox, self.score = self.run_bbox, 1.0
+        self.predicted, self.std, self.occluded_s, self.others, self.pred_log = False, 0.0, 0.0, [], []
         self.coord = self.new_coordinator()
         self.trail.clear()
         self.track_frames = 0
@@ -321,10 +415,11 @@ class App:
         c = self.coord
         t = self.track_frames / self.fps
         center = None
-        if self.bbox is not None and not self.tracker.lost:
-            center = (self.bbox[0] + self.bbox[2] / 2, self.bbox[1] + self.bbox[3] / 2)
+        if self.bbox is not None and not self.follower.lost:
+            center = (self.bbox[0] + self.bbox[2] / 2, self.bbox[1] + self.bbox[3] / 2)  # observed or predicted
             self.trail.append(center)
         self.track_log.append(center)
+        self.pred_log.append(bool(self.predicted and center is not None))
         c.update(t, center)
 
     def export_report(self, force: bool = False) -> Path | None:
@@ -337,10 +432,11 @@ class App:
         meta = {"video": self.video.name, "created": datetime.now().isoformat(timespec="seconds"),
                 "fps": round(self.fps, 3), "start_frame": self.run_start, "target": list(self.run_bbox),
                 "seed": self.seed, "initial_loss": self.run_loss, "replayed_scenario": self.replaying,
-                "zones": self.norm_zones(),
+                "zones": self.norm_zones(), "tracker": self.kind, "tracker_description": self.backend_desc,
+                "model": self.weights_name, "occluders": self.occluders, "max_occlusion_s": self.max_occ,
                 "events": self.replay_events if self.replaying else self.events}
         path = ROOT / "output" / "reports" / f"{self.video.stem}_{datetime.now():%Y%m%d_%H%M%S}.json"
-        write_report(path, meta, self.coord, self.track_log, self.fps)
+        write_report(path, meta, self.coord, self.track_log, self.fps, self.pred_log, self.follower.occlusions)
         self.msg = f"Report saved: {path.name}"
         print(self.msg)
         return path
@@ -351,16 +447,20 @@ class App:
         if not self.read():
             return False
         self.track_frames += 1
-        was_lost = self.tracker.lost
-        ok, bbox, score = self.tracker.update(self.work)
-        self.score = score
-        if ok:
-            self.bbox = bbox
-            cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
+        was_lost = self.follower.lost
+        res = self.follower.update(self.work, self.cam.update(self.small_gray))
+        self.score, self.others = res.score, res.others
+        self.predicted, self.std, self.occluded_s = res.predicted, res.std, res.occluded_s
+        t = self.track_frames / self.fps
+        for level, text in res.events:
+            self.coord.log(t, text, level)
+        if res.ok:
+            self.bbox = res.bbox
+            cx, cy = res.bbox[0] + res.bbox[2] / 2, res.bbox[1] + res.bbox[3] / 2
             self.zoom_c = (self.zoom_c[0] + 0.25 * (cx - self.zoom_c[0]), self.zoom_c[1] + 0.25 * (cy - self.zoom_c[1]))
         elif not was_lost:
             self.bbox = None
-            self.coord.mark_target_lost(self.track_frames / self.fps)
+            self.coord.mark_target_lost(t)
         self.step_sim()
         return True
 
@@ -375,10 +475,14 @@ class App:
             drag = (x1, y1, x2, y2)
         return Scene(stage=self.stage, work=self.work, full=self.full, zones=self.zones, coord=self.coord,
                      video_name=self.video.name, bbox=self.bbox, score=self.score,
-                     lost=self.tracker.lost or self.stage != "track", trail=list(self.trail), zoom=self.zoom,
+                     lost=self.follower.lost or self.stage != "track", trail=list(self.trail), zoom=self.zoom,
                      zoom_center=self.zoom_c, drag=drag, detections=self.detections, replaying=self.replaying,
                      paused=self.paused, ended=self.ended, frame_no=self.frame_no, nframes=self.nframes,
-                     t=(self.track_frames / self.fps) if self.stage == "track" else 0.0, toast=self.msg)
+                     t=(self.track_frames / self.fps) if self.stage == "track" else 0.0, toast=self.msg,
+                     predicted=self.predicted and self.stage == "track", std=self.std, occluded_s=self.occluded_s,
+                     others=self.others if self.stage == "track" else [],
+                     occluders=[(a * R.WORK_W, b * R.WORK_H, c * R.WORK_W, d * R.WORK_H) for a, b, c, d in self.occluders],
+                     backend=self.backend_label)
 
     def render(self):
         return self.ui.render(self.scene())
@@ -413,7 +517,7 @@ class App:
         if a.target:
             self.load_zones(a.zones)
             if not self.zones:
-                self.zones = auto_zones(R.WORK_W, R.WORK_H, 3)
+                self.set_equal_zones(3)
             self.seek(a.start_frame)
             self.begin_run(tuple(int(v) for v in a.target.split(",")))
             return True
@@ -421,8 +525,8 @@ class App:
 
     def run_headless(self):
         a = self.args
-        if not (a.scenario or a.replay or (a.zones and a.target)):
-            sys.exit("--headless needs --scenario/--replay, or --zones and --target")
+        if not (a.scenario or a.replay or ((a.zones or a.zone_count) and a.target)):
+            sys.exit("--headless needs --scenario/--replay, or (--zones or --zone-count) and --target")
         if not (a.scenario or a.replay):
             self.load_zones(a.zones)
         self.read()
@@ -445,7 +549,7 @@ class App:
         if self.coord:
             print("Summary:", json.dumps(self.coord.summary(), indent=1))
             print(f"Tracked {self.track_frames} frames; target "
-                  f"{'LOST' if self.tracker.lost else 'still tracked'} at end.")
+                  f"{'LOST' if self.follower.lost else 'still tracked'} at end.")
             self.export_report()
 
     def run(self):
@@ -472,8 +576,9 @@ class App:
                     self.ended = True
                     self.coord.log(self.track_frames / self.fps, "End of video", "info")
                     self.finish()
-            if self.stage == "select" and self.paused and self.detector and not self.detections:
-                self.detections = self.detector.detect(self.work)
+            if self.stage == "select" and self.paused and self.det_for != self.frame_no:
+                self.det_for = self.frame_no
+                self.detections = self.follower.preview(self.work)
             try:  # render at the window's real pixel size so nothing is rescaled (crisp text)
                 _, _, ww, wh = cv2.getWindowImageRect(WINDOW)
                 self.fit_layout(ww, wh)
@@ -525,6 +630,11 @@ class App:
             else:
                 self.msg = f"No scenario at {self.scenario_path.name} (press K during a run to save one)"
             return
+        if key in (ord("x"), ord("X")) and self.stage in ("zones", "select") and self.occluders:
+            self.occluders = []
+            self.refresh_frame()
+            self.msg = "Bridges cleared"
+            return
         if self.stage == "zones":
             if key in (13, 10):
                 if not self.zones:
@@ -538,7 +648,17 @@ class App:
             elif key in (ord("c"), ord("C")):
                 self.zones, self.msg = [], ""
             elif ord("2") <= key <= ord("6"):
-                self.zones = auto_zones(R.WORK_W, R.WORK_H, key - ord("0"))
+                self.set_equal_zones(n=key - ord("0"))
+            elif key in (ord("v"), ord("V")):
+                self.set_equal_zones(layout="vertical")
+            elif key in (ord("h"), ord("H")):
+                self.set_equal_zones(layout="horizontal")
+            elif key in (ord("g"), ord("G")):
+                self.set_equal_zones(layout="grid")
+            elif key in (ord("a"), ord("A")):
+                self.set_equal_zones(layout="auto")
+            elif key in (ord("["), ord("]")):
+                self.set_equal_zones(overlap=self.zone_overlap + (0.05 if key == ord("]") else -0.05))
         elif self.stage == "select":
             if key == ord(" "):
                 self.paused = not self.paused
@@ -574,8 +694,9 @@ class App:
                 self.autosave()
                 self.export_report()
                 self.stage, self.paused, self.ended = "select", True, False
-                self.tracker.lost = True
+                self.follower.lost = True
                 self.bbox = None
+                self.predicted = False
                 self.coord = self.new_coordinator()
             elif key in (ord("s"), ord("S")):
                 path = ROOT / "output" / f"screenshot_{self.frame_no:05d}.png"

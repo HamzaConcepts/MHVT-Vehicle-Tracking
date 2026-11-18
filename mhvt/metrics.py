@@ -30,7 +30,7 @@ def owner_at(timeline: list[tuple[float, int | None]], t: float) -> int | None:
     return owner
 
 
-def summarize(coord: Coordinator, track_log: list[Center], fps: float) -> dict:
+def summarize(coord: Coordinator, track_log: list[Center], fps: float, predicted: list[bool] | None = None) -> dict:
     n = len(track_log)
     tracked = [c is not None for c in track_log]
     tracked_frames = sum(tracked)
@@ -39,9 +39,12 @@ def summarize(coord: Coordinator, track_log: list[Center], fps: float) -> dict:
     lat = [h["latency_s"] for h in coord.handover_log if h["ok"]]
     ok, failed = coord.ok, coord.failed
     sent, dropped = coord.msgs_sent, coord.msgs_lost
+    pred_frames = sum(1 for i, p in enumerate(predicted or []) if p and i < n and track_log[i] is not None)
     return {
         "run_duration_s": round(n / fps, 3),
         "tracked_s": round(tracked_frames / fps, 3),
+        "observed_s": round((tracked_frames - pred_frames) / fps, 3),
+        "predicted_s": round(pred_frames / fps, 3),
         "target_lost_at_s": None if lost_frame is None else round(lost_frame / fps, 3),
         "tracking_continuity": round(tracked_frames / n, 4) if n else None,
         "coverage_continuity": round(owned / tracked_frames, 4) if tracked_frames else None,
@@ -69,10 +72,17 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, (c - h) / d), min(1.0, (c + h) / d))
 
 
-def write_report(path: Path, meta: dict, coord: Coordinator, track_log: list[Center], fps: float) -> Path:
+def write_report(path: Path, meta: dict, coord: Coordinator, track_log: list[Center], fps: float,
+                 predicted: list[bool] | None = None, occlusions: list[dict] | None = None) -> Path:
     """Writes <path> (JSON) and <path stem>.handovers.csv."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    report = {"meta": meta, "metrics": summarize(coord, track_log, fps),
+    occ = [dict(o, start_s=round(o["start_frame"] / fps, 3)) for o in (occlusions or [])]
+    m = summarize(coord, track_log, fps, predicted)
+    real = [o for o in occ if not o.get("reacquired") or (o.get("duration_s") or 0) >= 0.25]  # >= 0.25 s hidden
+    m["occlusions"] = len(real)
+    m["occlusions_recovered"] = sum(1 for o in real if o.get("reacquired"))
+    m["brief_dropouts"] = len(occ) - len(real)  # detector flicker of a few frames, bridged by prediction
+    report = {"meta": meta, "metrics": m, "occlusions": occ,
               "handovers": coord.handover_log,
               "log": [{"t": round(e.t, 3), "level": e.level, "text": e.text.strip()} for e in coord.events]}
     path.write_text(json.dumps(report, indent=1))

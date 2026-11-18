@@ -30,6 +30,22 @@ def test_renders_at_any_window_size(size, stage, lost):
     assert img.std() > 5  # something was actually drawn
 
 
+@pytest.mark.parametrize("size", [(1000, 563), (1600, 900)])
+def test_predicted_state_with_bridge_and_other_tracks_renders(size):
+    sc = scene("track")
+    sc.predicted, sc.std, sc.occluded_s = True, 30.0, 1.2
+    sc.occluders = [(500, 0, 700, 720)]
+    sc.others = [(5, (100, 100, 50, 28)), (6, (900, 400, 55, 30))]
+    sc.backend = "YOLO + ByteTrack"
+    ui = UI(Layout.fit(*size))
+    plain = UI(Layout.fit(*size)).render(scene("track")).copy()
+    img = ui.render(sc)
+    assert img.shape == plain.shape and not np.array_equal(img, plain)
+    x1, y1, x2, y2 = ui.L.video_px()
+    amber = (img[y1:y2, x1:x2] == np.array([32, 176, 255])).all(axis=2).sum()  # AMBER (BGR) pixels: ghost box / circle
+    assert amber > 50
+
+
 def test_six_drones_and_text_is_drawn():
     ui = UI(Layout.fit(1600, 900))
     img = ui.render(scene("track", n=6))

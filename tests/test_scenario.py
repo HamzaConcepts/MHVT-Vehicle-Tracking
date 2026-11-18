@@ -46,3 +46,22 @@ def test_rejects_newer_version(tmp_path):
     p.write_text(json.dumps(d))
     with pytest.raises(ValueError):
         Scenario.load(p)
+
+
+def test_backend_and_occluders_roundtrip_and_old_files_default_to_vit(tmp_path):
+    p = tmp_path / "s.json"
+    s = make(tracker="bytetrack", model="w.pt", occluders=[[0.4, 0.0, 0.6, 1.0]], max_occlusion_s=5.0)
+    s.save(p)
+    assert Scenario.load(p) == s
+    d = json.loads(p.read_text())
+    for k in ("tracker", "model", "occluders", "max_occlusion_s"):
+        d.pop(k)  # a file written before these fields existed
+    p.write_text(json.dumps(d))
+    old = Scenario.load(p)
+    assert old.tracker == "vit" and old.occluders == []
+
+
+@pytest.mark.parametrize("bad", [dict(tracker="deepsort"), dict(occluders=[[0.6, 0, 0.4, 1]]), dict(occluders=[[0, 0, 1]])])
+def test_rejects_bad_backend_or_occluder(tmp_path, bad):
+    with pytest.raises(ValueError):
+        make(**bad).save(tmp_path / "x.json")

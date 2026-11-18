@@ -3,9 +3,10 @@
 An interactive prototype of the MHVT mission-control experience, driven by a real video:
 
 1. **Load a video** (file dialog, or `python main.py my_video.mp4`).
-2. **Draw one zone per virtual UAV** on the first frame (or press `2`-`6` for automatic overlapping bands).
-3. **Click / drag a box on a vehicle.** It is tracked with a visual tracker (OpenCV VitTrack) and
-   enclosed in a box with a trail and a confidence score.
+2. **Make one zone per virtual UAV** - press `2`-`6` for equal-area zones (no drawing needed), or drag your own.
+3. **Click / drag a box on a vehicle.** A YOLOv8 detector + ByteTrack (or BoT-SORT) give every vehicle an ID and
+   follow the one you picked; if it disappears (a bridge, a building) its path is predicted and it is
+   re-acquired when it comes out. Without the detector it falls back to OpenCV VitTrack.
 4. A **zoomed "UAV camera" feed** follows the vehicle (cropped from the full-resolution frame).
 5. **Mission-control telemetry** shows every UAV's state, battery, link freshness and HandoverScore, plus a
    coordinator log of the handover protocol (REQ -> ACK -> ACQUIRED -> COMMIT) as the vehicle moves between zones.
@@ -19,17 +20,52 @@ An interactive prototype of the MHVT mission-control experience, driven by a rea
 git lfs pull                      # traffic.mp4 is stored in Git LFS (a clone without LFS gets a 133-byte stub)
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install ultralytics lap       # YOLO + ByteTrack/BoT-SORT backend (optional: without it the demo uses VitTrack)
 python main.py traffic.mp4
 ```
+`--tracker auto|bytetrack|botsort|vit` picks the backend (`auto` = YOLO + ByteTrack when it can be loaded, else VitTrack;
+the first lines printed say which one is running). `--imgsz 960` is faster, the default `1280` is more accurate.
 | Stage | Keys |
 |---|---|
-| Zones | drag = add zone, `2`-`6` = auto bands, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video), `O` load saved scenario |
-| Select | click or drag on a vehicle, `Space` play/pause to find a good frame, `,` `.` step a frame, `Esc` back to zones |
+| Zones | **`2`-`6` equal zones**, `V` vertical / `H` horizontal / `G` grid, `A` pick the layout from the video's motion, `[` `]` less/more overlap, or drag a custom zone; `Shift`+drag = simulated bridge, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video), `O` load saved scenario |
+| Select | click or drag on a vehicle, `Space` play/pause to find a good frame, `,` `.` step a frame, `Shift`+drag a bridge, `X` clear bridges, `Esc` back to zones |
 | Track | `Space` pause, **`T` restart the run**, **`K` save scenario**, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `E` write run report, `R` reselect, `O` load scenario, `S` screenshot, `F` fullscreen |
 | Any | `Q` quit |
 
 Things worth showing in a defense: press `L` to inject 10 % packet loss, or `2` to silence UAV-2 and watch
 the coordinator time it out (~3 s), fall back to another successor, or fail safely while the sending UAV keeps ownership.
+
+## Equal zones
+`mhvt/zoning.py` makes zones of exactly equal area that overlap their neighbours by a chosen fraction (default 15 %):
+`n` vertical bands, `n` horizontal bands, or a 2x2 / 2x3 grid. `A` looks at a few frame pairs of the video
+(optical flow) to see whether traffic moves along x or y and picks bands across the flow. From the command line:
+`--zone-count 4 --zone-layout auto --zone-overlap 0.15`.
+
+## Path prediction, bridges and re-acquisition
+When the followed vehicle's tracker ID vanishes (it drives under a bridge, behind a building, or ByteTrack just
+changes its ID) `mhvt/prediction.py` keeps going instead of giving up:
+* A Kalman motion model predicts the position (dead reckoning). The status turns **PREDICTING**: a dashed amber ghost
+  box with an uncertainty circle, the zoom feed says DEAD RECKONING, and the handover logic keeps running on the
+  predicted position.
+* Motion is modelled in *scene* coordinates: `mhvt/motion.py` measures the camera's own movement (phase
+  correlation), so the drone speeding up or slowing down does not throw the prediction off.
+* A vehicle that appears is accepted as the target only if it is **new** (an already-tracked car is another car),
+  lies inside a gate that is tight sideways (vehicles keep their lane) and loose along the road, has a similar size,
+  moved in the same direction, looks the same (colour histogram), passes for 4 frames in a row and is clearly better than
+  the runner-up. Two equally plausible vehicles => it refuses to guess.
+* No candidate within `--max-occlusion` seconds (default 8), or the prediction leaves the picture => **LOST**.
+
+No bridge in your footage? **Shift+drag** on the video (zones or select step) to add a simulated one. Its pixels are
+blanked, so the detector truly cannot see there. Bridges are saved in scenarios; `--occluder 0.45,0,0.6,1` does the
+same from the command line (fractions of the frame).
+
+**How well does it work?** `python scripts/eval_occlusion.py clip.mp4` measures it without labels: for each vehicle it
+compares a run with a bridge to a reference run without one. On the sample clip (bootstrap detector, 1280 px, 24 bridge
+placements): **13 correct (54 %), 7 locked onto a wrong vehicle (29 %), 4 never recovered (17 %)**. It is reliable when
+the prediction is good (error under ~30 px) and fails mostly when the vehicle has been followed for under a second before
+disappearing (its speed is not known yet), in dense traffic of similar cars, and with long occlusions. A
+stronger detector (see `docs/TRAINING.md`) steadies the tracker IDs and should help; the measurement is the
+tool to prove it. Not handled: occlusion while the drone itself turns or zooms (camera motion is translation-only).
 
 ## The window
 The interface is drawn at the window's real pixel size (resize it or press `F` for fullscreen; text stays sharp),
@@ -81,10 +117,12 @@ python main.py traffic.mp4 --headless --replay --save output/replay.mp4      # r
 ```
 
 ## Honest status
-* **Tracker:** VitTrack reports a confidence score, so the status switches to **LOST** instead of silently
-  following the wrong object; LOST is final until you reselect (`R`). Fast camera motion or leaving the frame
-  ends a track - the sample drone clip moves quickly, so tracks last ~5-8 s.
-* **Detector (optional, needs `pip install -r requirements-train.txt`):** stock COCO YOLOv8 finds only ~5 % of
+* **Trackers:** the main backend is YOLO + ByteTrack/BoT-SORT with path prediction (above). The VitTrack fallback
+  reports a confidence score, so it says **LOST** instead of silently following the wrong object, but it has no
+  prediction or re-acquisition. LOST is final until you reselect (`R`). Fast camera motion or leaving the frame
+  ends a track - the sample drone clip moves quickly, so tracks last ~5-8 s. On this clip ByteTrack and BoT-SORT
+  perform about the same (15 vs 11 fps on a 4-core CPU at 960 px); comparing them properly needs VisDrone-MOT labels.
+* **Detector (needs `pip install ultralytics lap`):** stock COCO YOLOv8 finds only ~5 % of
   the vehicles in top-down footage. `weights/vehicle_visdrone_n_bootstrap.pt` is a *bootstrap* YOLOv8n fine-tuned
   on VisDrone (single `vehicle` class, 6 epochs on 40 % of the data at 640 px, trained on a laptop-class CPU):
   mAP50 0.64 on VisDrone val, ~25-30 vehicles found per frame of `traffic.mp4` instead of ~1. Use it with
@@ -97,15 +135,17 @@ python main.py traffic.mp4 --headless --replay --save output/replay.mp4      # r
 ```
 main.py                  interactive demo + headless mode
 mhvt/coordinator.py      zones, HandoverScore ranking, handover protocol state machine (pure Python, tested)
-mhvt/tracking.py         VitTrack wrapper with LOST logic; optional YOLO detector
+mhvt/tracking.py         YOLO + ByteTrack/BoT-SORT follower, VitTrack fallback
+mhvt/prediction.py       Kalman path prediction + re-acquisition after occlusions (pure, tested)
+mhvt/motion.py           camera-motion estimate;  mhvt/zoning.py = equal-area automatic zones
 mhvt/render.py           window drawing (video, zoom feed, telemetry, log)
 mhvt/scenario.py         save/load of a repeatable run (zones, target, seed, events)
 mhvt/metrics.py          run metrics + report writer; mhvt/experiment.py = offline replay/sweeps
 models/                  VitTrack ONNX (Apache-2.0, from opencv_zoo)
 weights/                bootstrap vehicle detector (VisDrone fine-tune)
-scripts/                 run_experiments.py, prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
+scripts/                 eval_occlusion.py, run_experiments.py, prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
 assets/fonts/            Inter (OFL) used by the UI
-tests/                   pytest for the coordinator (single owner, 10 % loss, faults, reproducibility)
+tests/                   pytest: coordinator, prediction, zoning, scenarios, experiments, rendering
 docs/                    DATASETS.md, TRAINING.md
 notebooks/               Colab/Kaggle training notebook
 ```
