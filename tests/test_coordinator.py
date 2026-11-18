@@ -87,3 +87,22 @@ def test_reproducible_with_same_seed():
         run(c, sweep(50, 1230, 24 * 20))
         return [(round(e.t, 3), e.text) for e in c.events]
     assert go() == go()
+
+
+def test_target_lost_mid_handover_is_aborted_not_failed():
+    c = Coordinator(ZONES, Config(seed=1))
+    run(c, sweep(50, 300, 60))  # reaches the zone-1 edge -> handover in progress
+    if c.handover is None:
+        c.update(2.6, (320, 360))
+    assert c.handover is not None
+    c.mark_target_lost(3.0)
+    assert (c.ok, c.failed, c.aborted) == (0, 0, 1)
+    assert c.handover_log[-1]["ok"] is None
+
+
+def test_handover_log_and_timeline():
+    c = Coordinator(ZONES, Config(seed=1))
+    run(c, sweep(50, 1230, 24 * 20))
+    assert [h["ok"] for h in c.handover_log] == [True, True, True]
+    assert [o for _, o in c.timeline] == [1, 2, 3, 4]
+    assert all(h["latency_s"] > 0 for h in c.handover_log)

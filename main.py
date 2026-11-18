@@ -20,13 +20,16 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 
 import cv2
 
 from mhvt import render as R
+from mhvt.render import UI, Layout, Scene
 from mhvt.coordinator import Config, Coordinator, auto_zones
+from mhvt.metrics import write_report
 from mhvt.scenario import Scenario, default_path, last_run_path
 from mhvt.tracking import Detector, TargetTracker, snap_to_detection
 
@@ -118,7 +121,11 @@ class App:
         self.track_frames = 0
         self.detections = []
         self.writer = None
-        self.msg = ""
+        self._msg, self._msg_until = "", 0.0
+        self.layout = Layout.fit(R.DESIGN_W, R.DESIGN_H)
+        self.ui = UI(self.layout)
+        self.rec_ui: UI | None = None         # fixed-size renderer for --save recordings
+        self.fullscreen = False
         # run definition (what a scenario file stores)
         self.run_start = 0
         self.run_bbox: tuple[int, int, int, int] | None = None
@@ -128,8 +135,18 @@ class App:
         self.replay_events: list[dict] = []   # scripted events being replayed
         self.pending: list[dict] = []
         self.replaying = False
+        self.track_log: list = []          # target centre per tracked frame (None once lost)
+        self.report_done = True
         self.shots = {int(s) for s in args.screenshots.split(",") if s}
         (ROOT / "output").mkdir(exist_ok=True)
+
+    @property
+    def msg(self) -> str:
+        return self._msg if time.time() < self._msg_until else ""
+
+    @msg.setter
+    def msg(self, v: str) -> None:
+        self._msg, self._msg_until = v, (time.time() + 4.0 if v else 0.0)
 
     # ------------------------------------------------------------ frames
     def read(self) -> bool:
@@ -211,9 +228,11 @@ class App:
 
     # ------------------------------------------------------------- mouse
     def to_work(self, x, y):
-        if x >= R.MAIN_W or y >= R.MAIN_H:
+        vx1, vy1, vx2, vy2 = self.layout.video_px()
+        if not (vx1 <= x < vx2 and vy1 <= y < vy2):
             return None
-        return x / R.SCALE, y / R.SCALE
+        k = self.layout.video_scale()
+        return (x - vx1) / k, (y - vy1) / k
 
     def on_mouse(self, event, x, y, flags, _):
         if self.stage not in ("zones", "select"):
@@ -256,6 +275,8 @@ class App:
         self.replay_events = list(events or [])
         self.pending = list(self.replay_events) if replaying else []
         self.events = []
+        self.track_log = []
+        self.report_done = False
         self.tracker.init(self.work, self.run_bbox)
         self.bbox, self.score = self.run_bbox, 1.0
         self.coord = self.new_coordinator()
@@ -270,6 +291,7 @@ class App:
     def restart_run(self):
         if self.run_bbox is None:
             return
+        self.export_report()
         self.seek(self.run_start)
         self.loss, self.zoom = self.run_loss, self.run_zoom
         self.begin_run(self.run_bbox, events=self.replay_events, replaying=self.replaying)
@@ -302,7 +324,26 @@ class App:
         if self.bbox is not None and not self.tracker.lost:
             center = (self.bbox[0] + self.bbox[2] / 2, self.bbox[1] + self.bbox[3] / 2)
             self.trail.append(center)
+        self.track_log.append(center)
         c.update(t, center)
+
+    def export_report(self, force: bool = False) -> Path | None:
+        """Write the run report (JSON + handovers CSV) once per run."""
+        if not self.coord or self.run_bbox is None or len(self.track_log) < 2:
+            return None
+        if self.report_done and not force:
+            return None
+        self.report_done = True
+        meta = {"video": self.video.name, "created": datetime.now().isoformat(timespec="seconds"),
+                "fps": round(self.fps, 3), "start_frame": self.run_start, "target": list(self.run_bbox),
+                "seed": self.seed, "initial_loss": self.run_loss, "replayed_scenario": self.replaying,
+                "zones": self.norm_zones(),
+                "events": self.replay_events if self.replaying else self.events}
+        path = ROOT / "output" / "reports" / f"{self.video.stem}_{datetime.now():%Y%m%d_%H%M%S}.json"
+        write_report(path, meta, self.coord, self.track_log, self.fps)
+        self.msg = f"Report saved: {path.name}"
+        print(self.msg)
+        return path
 
     def advance_track(self) -> bool:
         while self.pending and self.pending[0]["frame"] <= self.track_frames:
@@ -324,63 +365,39 @@ class App:
         return True
 
     # ------------------------------------------------------------- render
-    def render(self):
-        t = (self.track_frames / self.fps) if self.coord else 0.0
-        main = cv2.resize(self.work, (R.MAIN_W, R.MAIN_H), interpolation=cv2.INTER_AREA)
-        pending = None
+    def scene(self) -> Scene:
+        if self.stage != "track" and (self.coord is None or len(self.coord.drones) != len(self.zones)):
+            self.coord = self.new_coordinator()
+        drag = None
         if self.drag0 and self.drag1:
             x1, x2 = sorted((self.drag0[0], self.drag1[0]))
             y1, y2 = sorted((self.drag0[1], self.drag1[1]))
-            pending = (x1, y1, x2, y2)
-        coord = self.coord if self.stage == "track" else None
-        R.draw_zones(main, coord, self.zones, pending=pending if self.stage == "zones" else None, t=t)
-        for (x, y, w, h) in self.detections:
-            cv2.rectangle(main, R.sp((x, y)), R.sp((x + w, y + h)), (200, 200, 200), 1)
-        lost = self.tracker.lost
-        if self.stage == "track":
-            R.draw_target(main, self.bbox, self.score, lost, self.trail)
-            R.draw_handover(main, self.coord, self.zones)
-        elif pending is not None and self.stage == "select":
-            cv2.rectangle(main, R.sp(pending[:2]), R.sp(pending[2:]), R.GREEN, 2)
-        if self.stage == "track":
-            if self.ended:
-                track_msg, track_col = "END OF VIDEO - T restart run, R reselect, K save scenario", R.AMBER
-            elif lost:
-                track_msg, track_col = "TARGET LOST - T restart run, R reselect", R.RED
-            else:
-                track_msg = ("REPLAY  " if self.replaying else "") + "TRACKING"
-                track_col = R.GREEN
-            track_msg += f"   frame {self.frame_no}/{self.nframes}  {self.msg}"
-        else:
-            track_msg, track_col = "", R.GREEN
-        banners = {
-            "zones": ("STEP 1/3  Draw one zone per UAV (drag). 2-6 = auto bands. Enter = continue. O = load scenario. "
-                      f"Zones: {len(self.zones)}  {self.msg}", R.CYAN),
-            "select": (f"STEP 2/3  Click or drag a box around the vehicle. Space = play/pause, , . = step  {self.msg}", R.CYAN),
-            "track": (track_msg, track_col),
-        }
-        R.draw_status_banner(main, *banners[self.stage])
+            drag = (x1, y1, x2, y2)
+        return Scene(stage=self.stage, work=self.work, full=self.full, zones=self.zones, coord=self.coord,
+                     video_name=self.video.name, bbox=self.bbox, score=self.score,
+                     lost=self.tracker.lost or self.stage != "track", trail=list(self.trail), zoom=self.zoom,
+                     zoom_center=self.zoom_c, drag=drag, detections=self.detections, replaying=self.replaying,
+                     paused=self.paused, ended=self.ended, frame_no=self.frame_no, nframes=self.nframes,
+                     t=(self.track_frames / self.fps) if self.stage == "track" else 0.0, toast=self.msg)
 
-        owner = self.coord.owner if self.coord else None
-        name = f"UAV-{owner}" if owner else "UAV"
-        zoom = R.zoom_panel(self.full, self.zoom_c, lost or self.stage != "track", self.zoom, name)
-        if self.stage != "track" and (self.coord is None or len(self.coord.drones) != len(self.zones)):
-            self.coord = self.new_coordinator()
-        status = "IDLE" if self.stage != "track" else ("LOST" if lost else "TRACKING")
-        tel = R.telemetry_panel(self.coord, status, self.score, (R.SIDE_W, R.CANVAS_H - R.ZOOM_H), t)
-        help_text = {"zones": "drag zone | 2-6 auto | Bksp undo | C clear | Enter next | O load scenario | Q quit",
-                     "select": "click/drag vehicle | Space play | , . step | Esc zones | O load scenario | Q quit",
-                     "track": "Space pause | T restart | K save | Z zoom | L loss | 1-6 fault | R reselect | O load | Q quit"}[self.stage]
-        logp = R.log_panel(self.coord, (R.MAIN_W, R.CANVAS_H - R.MAIN_H), help_text)
-        return R.compose(main, zoom, tel, logp)
+    def render(self):
+        return self.ui.render(self.scene())
 
-    def write(self, canvas):
-        if self.args.save:
-            if self.writer is None:
-                self.args.save.parent.mkdir(parents=True, exist_ok=True)
-                self.writer = cv2.VideoWriter(str(self.args.save), cv2.VideoWriter_fourcc(*"mp4v"),
-                                              self.fps, (R.CANVAS_W, R.CANVAS_H))
-            self.writer.write(canvas)
+    def fit_layout(self, w: int, h: int) -> None:
+        if (w, h) != (self.layout.W, self.layout.H) and w > 200 and h > 120:
+            self.layout = Layout.fit(w, h)
+            self.ui = UI(self.layout)
+
+    def write(self):
+        """Record the window as a fixed 1600x900 video (independent of the live window size)."""
+        if not self.args.save:
+            return
+        if self.rec_ui is None:
+            self.rec_ui = UI(Layout.fit(R.DESIGN_W, R.DESIGN_H))
+            self.args.save.parent.mkdir(parents=True, exist_ok=True)
+            self.writer = cv2.VideoWriter(str(self.args.save), cv2.VideoWriter_fourcc(*"mp4v"),
+                                          self.fps, (R.DESIGN_W, R.DESIGN_H))
+        self.writer.write(self.rec_ui.render(self.scene()))
 
     # --------------------------------------------------------------- run
     def start_from_args(self) -> bool:
@@ -414,7 +431,7 @@ class App:
         while True:
             if n in self.shots:
                 cv2.imwrite(str(ROOT / "output" / f"shot_{n:04d}.png"), self.render())
-            self.write(self.render())
+            self.write()
             if not self.advance_track() or (a.max_frames and n >= a.max_frames):
                 break
             n += 1
@@ -429,6 +446,7 @@ class App:
             print("Summary:", json.dumps(self.coord.summary(), indent=1))
             print(f"Tracked {self.track_frames} frames; target "
                   f"{'LOST' if self.tracker.lost else 'still tracked'} at end.")
+            self.export_report()
 
     def run(self):
         if self.args.headless:
@@ -436,7 +454,9 @@ class App:
         self.load_zones(self.args.zones)
         self.read()
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW, 1360, 765)
+        w, h = self.initial_window_size()
+        cv2.resizeWindow(WINDOW, w, h)
+        self.fit_layout(w, h)
         cv2.setMouseCallback(WINDOW, self.on_mouse)
         if self.start_from_args():
             pass
@@ -454,10 +474,14 @@ class App:
                     self.finish()
             if self.stage == "select" and self.paused and self.detector and not self.detections:
                 self.detections = self.detector.detect(self.work)
-            canvas = self.render()
+            try:  # render at the window's real pixel size so nothing is rescaled (crisp text)
+                _, _, ww, wh = cv2.getWindowImageRect(WINDOW)
+                self.fit_layout(ww, wh)
+            except cv2.error:
+                pass
+            cv2.imshow(WINDOW, self.render())
             if self.stage == "track" and not self.ended and not self.paused:
-                self.write(canvas)
-            cv2.imshow(WINDOW, canvas)
+                self.write()
             wait = max(1, int(1000 / self.fps - (time.time() - t0) * 1000))
             if self.paused or self.ended:
                 wait = 30
@@ -466,12 +490,34 @@ class App:
                 break
             self.handle_key(key)
         self.autosave()
+        self.export_report()
         if self.writer:
             self.writer.release()
         cv2.destroyAllWindows()
 
+    @staticmethod
+    def initial_window_size() -> tuple[int, int]:
+        """Largest 16:9-ish window (up to 1600x900) that fits the screen."""
+        sw, sh = 1600, 900
+        try:
+            import tkinter as tk
+
+            r = tk.Tk()
+            r.withdraw()
+            sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+            r.destroy()
+        except Exception:
+            pass
+        f = min(1.0, (sw * 0.96) / R.DESIGN_W, (sh * 0.88) / R.DESIGN_H)
+        return int(R.DESIGN_W * f), int(R.DESIGN_H * f)
+
     def handle_key(self, key):
         if key == 255:
+            return
+        if key in (ord("f"), ord("F")):
+            self.fullscreen = not self.fullscreen
+            cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL)
             return
         if key in (ord("o"), ord("O")):
             if self.scenario_path.is_file():
@@ -522,8 +568,11 @@ class App:
             elif ord("1") <= key <= ord("6") and key - ord("0") <= len(self.zones):
                 d = self.coord.drone(key - ord("0"))
                 self.do_event({"type": "fault", "drone": d.id, "silent": not d.silent})
+            elif key in (ord("e"), ord("E")):
+                self.export_report(force=True)
             elif key in (ord("r"), ord("R")):
                 self.autosave()
+                self.export_report()
                 self.stage, self.paused, self.ended = "select", True, False
                 self.tracker.lost = True
                 self.bbox = None

@@ -1,3 +1,4 @@
 # Demo app (main.py). Use the *contrib* build; do NOT install plain opencv-python alongside it.
 opencv-contrib-python>=4.9
 numpy
+pillow

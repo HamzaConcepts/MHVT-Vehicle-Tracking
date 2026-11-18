@@ -121,7 +121,10 @@ class Coordinator:
         self.target_lost = False
         self.ok = 0
         self.failed = 0
+        self.aborted = 0                     # handovers cut short because the vision tracker lost the target
         self.latencies: list[float] = []
+        self.handover_log: list[dict] = []   # one record per finished handover attempt
+        self.timeline: list[tuple[float, int | None]] = []  # (t, owner) at every ownership change
         self.msgs_sent = 0
         self.msgs_lost = 0
         self._queue: list[_Msg] = []
@@ -193,9 +196,14 @@ class Coordinator:
             return
         self.target_lost = True
         if self.handover:
-            self._abort_handover(t, "target lost", count=True)
+            h = self.handover
+            self._abort_handover(t, "target lost", count=False)
+            self._record(h, t, None, "target lost (vision)")
+            self.aborted += 1
+            self.log(t, f"HANDOVER #{h.hid} aborted (target lost by vision tracker)", "warn")
         if self.owner is not None:
             self.drone(self.owner).state = DState.SEARCHING
+            self.timeline.append((t, None))
             self.log(t, f"TARGET LOST - {self.drone(self.owner).name} searching", "err")
 
     # ------------------------------------------------------------- update
@@ -243,6 +251,7 @@ class Coordinator:
             if self.handover:
                 self._abort_handover(t, "owner offline", count=True)
             self.owner = None
+            self.timeline.append((t, None))
             self._initial_assign(t, target)
 
     # --------------------------------------------------------- assignment
@@ -256,6 +265,7 @@ class Coordinator:
             return
         best = self.drone(rows[0]["id"])
         self.owner = best.id
+        self.timeline.append((t, best.id))
         best.state = DState.TRACKING
         self.log(t, f"ASSIGN target -> {best.name} (score {rows[0]['score']:.2f})", "ok")
 
@@ -333,8 +343,10 @@ class Coordinator:
         src.state = DState.STANDBY
         dst.state = DState.TRACKING
         self.owner = dst.id
+        self.timeline.append((t, dst.id))
         self.ok += 1
         self.latencies.append(t - h.t_start)
+        self._record(h, t, True, "")
         self.handover = None
         self._cooldown_until = t + self.cfg.cooldown
         self.log(t, f"COMMIT: {dst.name} is now the single owner "
@@ -401,7 +413,16 @@ class Coordinator:
         self._cooldown_until = t + self.cfg.cooldown
         if count:
             self.failed += 1
+            self._record(h, t, False, why)
             self.log(t, f"HANDOVER #{h.hid} FAILED ({why}) - {src.name} keeps the target", "err")
+
+    def _record(self, h: Handover, t: float, ok: bool, why: str) -> None:
+        self.handover_log.append({
+            "id": h.hid, "source": h.source, "successor": h.successor, "reason": h.reason,
+            "t_start": round(h.t_start, 3), "t_end": round(t, 3), "ok": ok,
+            "latency_s": round(t - h.t_start, 3) if ok else None,
+            "candidates_tried": h.idx + 1, "why_failed": why or None,
+        })
 
     # ------------------------------------------------------------- stats
     def summary(self) -> dict:
@@ -409,6 +430,7 @@ class Coordinator:
         return {
             "handovers_ok": self.ok,
             "handovers_failed": self.failed,
+            "handovers_aborted": self.aborted,
             "success_rate": (self.ok / total) if total else None,
             "mean_latency_s": (sum(self.latencies) / len(self.latencies)) if self.latencies else None,
             "msgs_sent": self.msgs_sent,

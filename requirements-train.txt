@@ -2,5 +2,4 @@
 -r requirements.txt
 ultralytics
 lap>=0.5.12
-pillow
 pytest

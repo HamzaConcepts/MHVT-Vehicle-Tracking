@@ -25,11 +25,17 @@ python main.py traffic.mp4
 |---|---|
 | Zones | drag = add zone, `2`-`6` = auto bands, `Backspace` undo, `C` clear, `Enter` continue (zones are remembered next to the video), `O` load saved scenario |
 | Select | click or drag on a vehicle, `Space` play/pause to find a good frame, `,` `.` step a frame, `Esc` back to zones |
-| Track | `Space` pause, **`T` restart the run**, **`K` save scenario**, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `R` reselect, `O` load scenario, `S` screenshot |
+| Track | `Space` pause, **`T` restart the run**, **`K` save scenario**, `Z` zoom 2x/3x/4x/6x, `L` message loss 0/10/30 %, `1`-`6` cut/restore a UAV's telemetry (fault injection), `E` write run report, `R` reselect, `O` load scenario, `S` screenshot, `F` fullscreen |
 | Any | `Q` quit |
 
 Things worth showing in a defense: press `L` to inject 10 % packet loss, or `2` to silence UAV-2 and watch
 the coordinator time it out (~3 s), fall back to another successor, or fail safely while the sending UAV keeps ownership.
+
+## The window
+The interface is drawn at the window's real pixel size (resize it or press `F` for fullscreen; text stays sharp),
+with a header showing the three steps, the video with zones and target, a zoomed UAV camera, a telemetry panel
+(target state, owner, handover counts, message loss, a coverage strip and one card per UAV) and a coordinator log
+with on-screen key hints. Font: Inter (SIL OFL, in `assets/fonts/`).
 
 ## Repeatable runs (save / replay / restart)
 A **scenario** captures everything needed to repeat a test: the zones, the start frame, the vehicle you picked,
@@ -50,6 +56,23 @@ zoom) with the frame it happened at.
 
 Replays are deterministic: the tracker and the seeded coordinator give the same result every time on the same
 video (checked in testing). Keep the video file name unchanged, because a scenario is tied to it.
+
+## Run report and experiments
+**Run report.** When a run ends (end of video, restart, reselect, quit, or `E`), the program writes
+`output/reports/<video>_<time>.json` plus `.handovers.csv`: tracked time, tracking continuity, how long exactly one UAV
+owned the target, every handover (reason, latency, success), messages sent/dropped (delivery ratio) and the full log.
+A handover cut short because the *vision* tracker lost the target is counted as `aborted`, not as a protocol failure.
+
+**Experiments (report NFR3).** Turn a saved scenario into numbers:
+```bash
+python scripts/run_experiments.py clip.mp4 --seeds 100            # loss 0/5/10/20/30 %
+python scripts/run_experiments.py clip.mp4 --faults --losses 0,0.1 # also replay the scenario's UAV faults
+```
+The tracker runs once (cached), then the coordinator is replayed for every seed and loss level, which takes seconds.
+`output/experiments/<clip>/` gets `summary.md` (table with 95 % Wilson intervals and a PASS/FAIL for NFR3: >= 90 %
+handover success at 10 % loss), `summary.csv`, `runs.csv` and `success_vs_loss.png`. The offline replay is tested to
+reproduce the live app exactly. Caveats: the link is simulated, and all seeds replay the *same* target path, so the
+attempts are not fully independent - quote the interval, and use several clips for a convincing result.
 
 Headless / scripted (also records a video of the whole window):
 ```bash
@@ -77,9 +100,11 @@ mhvt/coordinator.py      zones, HandoverScore ranking, handover protocol state m
 mhvt/tracking.py         VitTrack wrapper with LOST logic; optional YOLO detector
 mhvt/render.py           window drawing (video, zoom feed, telemetry, log)
 mhvt/scenario.py         save/load of a repeatable run (zones, target, seed, events)
+mhvt/metrics.py          run metrics + report writer; mhvt/experiment.py = offline replay/sweeps
 models/                  VitTrack ONNX (Apache-2.0, from opencv_zoo)
 weights/                bootstrap vehicle detector (VisDrone fine-tune)
-scripts/                 prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
+scripts/                 run_experiments.py, prepare_visdrone.py, train_vehicle_detector.py, yolo_bytetrack_baseline.py
+assets/fonts/            Inter (OFL) used by the UI
 tests/                   pytest for the coordinator (single owner, 10 % loss, faults, reproducibility)
 docs/                    DATASETS.md, TRAINING.md
 notebooks/               Colab/Kaggle training notebook
